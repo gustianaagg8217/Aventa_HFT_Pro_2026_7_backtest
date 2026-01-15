@@ -1,0 +1,1 @@
+python -m nuitka --onefile --standalone --windows-console-mode=disable --enable-plugin=tk-inter --lto=yes --clang --windows-icon-from-ico=assets\aventa.ico --output-filename=Aventa_HFT_Pro_2026_v7.exe gui_launcher.py

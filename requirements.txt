@@ -1,3 +1,4 @@
+# Core
 MetaTrader5>=5.0.45
 numpy>=1.21.0
 pandas>=1.3.0
@@ -5,3 +6,11 @@ scikit-learn>=1.0.0
 python-telegram-bot>=20.0
 joblib>=1.1.0
 matplotlib>=3.5.0
+scipy>=1.7.0
+tensorflow>=2.8.0,<2.21.0
+
+# Extended
+numba>=0.56.0
+seaborn>=0.11.0
+psutil>=5.8.0
+statsmodels>=0.13.0

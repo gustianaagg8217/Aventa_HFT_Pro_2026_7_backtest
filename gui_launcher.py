@@ -1397,7 +1397,14 @@ class HFTProGUI:
             import threading
             def backtest_thread():
                 try:
-                    # Simulate backtest (simplified version)
+                    # Import BacktestEngine
+                    try:
+                        from backtest_engine import BacktestEngine
+                    except ImportError:
+                        self.root.after(0, lambda: self.update_backtest_status("❌ backtest_engine.py not found", error=True))
+                        return
+                    
+                    # Initialize MT5
                     import MetaTrader5 as mt5
                     
                     if not mt5.initialize():
@@ -1405,242 +1412,157 @@ class HFTProGUI:
                         return
                     
                     # Progress update
-                    self.root.after(0, lambda: self.update_backtest_progress(15, "🔍 Analyzing market data..."))
+                    self.root.after(0, lambda: self.update_backtest_progress(15, "🔍 Creating backtest engine..."))
                     
-                    # Get historical data
-                    days = (end_date - start_date).days
-                    rates = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_M5, end_date, days * 288)  # 288 bars per day for M5
+                    # Create BacktestEngine instance
+                    engine = BacktestEngine(symbol=symbol, initial_balance=initial_balance)
                     
-                    if rates is None or len(rates) == 0:
+                    # Progress update
+                    self.root.after(0, lambda: self.update_backtest_progress(25, "📊 Loading OHLCV data..."))
+                    self.root.after(0, lambda: self.backtest_stats_text.insert(tk.END, "📊 Loading OHLCV bars from MT5...\n"))
+                    
+                    # Load data using BacktestEngine
+                    df = engine.load_data(symbol, start_date, end_date, mt5.TIMEFRAME_M5)
+                    
+                    if df is None or len(df) == 0:
                         self.root.after(0, lambda: self.update_backtest_status("❌ No data available for this period", error=True))
+                        mt5.shutdown()
                         return
                     
-                    import pandas as pd
-                    df = pd.DataFrame(rates)
-                    df['time'] = pd.to_datetime(df['time'], unit='s')
+                    # Progress update
+                    self.root.after(0, lambda: self.update_backtest_progress(35, "✅ Loaded {} bars".format(len(df))))
+                    self.root.after(0, lambda: self.backtest_stats_text.insert(tk.END, "✅ Retrieved {} bars of data\n".format(len(df))))
+                    
+                    # Define strategy function for backtest
+                    def strategy_func(df_segment):
+                        """
+                        Strategy function that receives dataframe segment up to current bar.
+                        Returns 1 for BUY, -1 for SELL, 0 for NO SIGNAL
+                        """
+                        if len(df_segment) < 20:
+                            return 0
+                        
+                        # Simple SMA crossover strategy with min signal strength filter
+                        sma_5 = df_segment['close'].iloc[-5:].mean()
+                        sma_20 = df_segment['close'].iloc[-20:].mean()
+                        current_price = df_segment['close'].iloc[-1]
+                        
+                        # BUY: Fast SMA > Slow SMA with minimum signal strength
+                        if sma_5 > sma_20:
+                            signal_strength = (sma_5 - sma_20) / current_price * 1000
+                            if signal_strength > min_signal:
+                                return 1
+                        
+                        # SELL: Fast SMA < Slow SMA with minimum signal strength  
+                        elif sma_5 < sma_20:
+                            signal_strength = (sma_20 - sma_5) / current_price * 1000
+                            if signal_strength > min_signal * 0.8:  # Slightly lower threshold for shorts
+                                return -1
+                        
+                        return 0
                     
                     # Progress update
-                    self.root.after(0, lambda: self.update_backtest_progress(25, f"✅ Loaded {len(df)} bars"))
-                    self.root.after(0, lambda: self.backtest_stats_text.insert(tk.END, f"✅ Retrieved {len(df)} bars of data\n"))
+                    self.root.after(0, lambda: self.update_backtest_progress(45, "⚙️ Running backtest simulation..."))
+                    self.root.after(0, lambda: self.backtest_stats_text.insert(tk.END, "\n⚙️ Simulating trades with realistic position management...\n"))
                     
-                    # Simple strategy simulation
-                    balance = 10000  # Starting balance
-                    trades = []
-                    wins = 0
-                    losses = 0
-                    total_profit = 0
+                    # Run backtest with engine
+                    metrics = engine.run_backtest(
+                        df, 
+                        strategy_func, 
+                        commission=0.0002,  # 0.02% per side
+                        slippage=0.00001     # 0.1 pips
+                    )
                     
-                    # Progress update
-                    self.root.after(0, lambda: self.update_backtest_progress(30, "⚙️ Calculating indicators..."))
-                    self.root.after(0, lambda: self.backtest_stats_text.insert(tk.END, "\n⚙️ Calculating technical indicators...\n"))
-                    
-                    # Calculate indicators
-                    df['ema_fast'] = df['close'].ewm(span=10).mean()
-                    df['ema_slow'] = df['close'].ewm(span=20).mean()
-                    df['rsi'] = self.calculate_rsi(df['close'], 14)
+                    mt5.shutdown()
                     
                     # Progress update
-                    self.root.after(0, lambda: self.update_backtest_progress(40, "🔎 Generating trading signals..."))
-                    self.root.after(0, lambda: self.backtest_stats_text.insert(tk.END, "🔎 Scanning for trading opportunities...\n\n"))
+                    self.root.after(0, lambda: self.update_backtest_progress(90, "📈 Calculating performance metrics..."))
                     
-                    # Generate signals with progress updates
-                    total_bars = len(df)
-                    signals_found = 0
-                    
-                    for i in range(50, len(df)):
-                        # Update progress every 100 bars
-                        if i % 100 == 0:
-                            progress = 40 + int((i - 50) / (total_bars - 50) * 50)
-                            bars_processed = i
-                            self.root.after(0, lambda p=progress, b=bars_processed: 
-                                          self.update_backtest_progress(p, f"🔄 Processing: {b}/{total_bars} bars | Signals: {signals_found} | Trades: {len(trades)}"))
-                        
-                        # Multiple strategy conditions for better signal generation
-                        ema_bullish = df['ema_fast'].iloc[i] > df['ema_slow'].iloc[i]
-                        ema_bearish = df['ema_fast'].iloc[i] < df['ema_slow'].iloc[i]
-                        ema_crossover_up = df['ema_fast'].iloc[i] > df['ema_slow'].iloc[i] and df['ema_fast'].iloc[i-1] <= df['ema_slow'].iloc[i-1]
-                        ema_crossover_down = df['ema_fast'].iloc[i] < df['ema_slow'].iloc[i] and df['ema_fast'].iloc[i-1] >= df['ema_slow'].iloc[i-1]
-                        
-                        rsi_oversold = df['rsi'].iloc[i] < 30
-                        rsi_overbought = df['rsi'].iloc[i] > 70
-                        rsi_neutral = 40 <= df['rsi'].iloc[i] <= 60
-                        
-                        # Calculate signal strength (percentage change)
-                        price_momentum = abs(df['close'].iloc[i] - df['close'].iloc[i-5]) / df['close'].iloc[i-5]
-                        ema_spread = abs(df['ema_fast'].iloc[i] - df['ema_slow'].iloc[i]) / df['close'].iloc[i]
-                        signal_strength = (price_momentum + ema_spread) / 2
-                        
-                        # BUY conditions: EMA crossover UP or bullish trend with oversold RSI
-                        buy_signal = False
-                        if ema_crossover_up and signal_strength >= min_signal:
-                            buy_signal = True
-                        elif ema_bullish and rsi_oversold and signal_strength >= min_signal * 0.5:
-                            buy_signal = True
-                        
-                        if buy_signal:
-                            signals_found += 1
-                        if buy_signal:
-                            signals_found += 1
-                            entry_price = df['close'].iloc[i]
-                            atr = df['high'].iloc[i-20:i].max() - df['low'].iloc[i-20:i].min()
-                            if atr == 0:
-                                atr = df['close'].iloc[i] * 0.01  # Fallback 1% of price
-                            
-                            sl_price = entry_price - (atr * sl_multi)
-                            tp_price = entry_price + (atr * sl_multi * rr_ratio)
-                            
-                            # Simulate trade outcome (look ahead 20-200 bars)
-                            lookback_end = min(i + 200, len(df))
-                            future_high = df['high'].iloc[i:lookback_end].max()
-                            future_low = df['low'].iloc[i:lookback_end].min()
-                            
-                            if future_high >= tp_price:
-                                profit = (tp_price - entry_price) * 100  # Simplified P&L
-                                wins += 1
-                                total_profit += profit
-                                balance += profit
-                                trades.append({
-                                    'time': df['time'].iloc[i],
-                                    'type': 'BUY',
-                                    'entry': entry_price,
-                                    'exit': tp_price,
-                                    'profit': profit,
-                                    'result': 'WIN'
-                                })
-                            elif future_low <= sl_price:
-                                loss = (sl_price - entry_price) * 100
-                                losses += 1
-                                total_profit += loss
-                                balance += loss
-                                trades.append({
-                                    'time': df['time'].iloc[i],
-                                    'type': 'BUY',
-                                    'entry': entry_price,
-                                    'exit': sl_price,
-                                    'profit': loss,
-                                    'result': 'LOSS'
-                                })
-                        
-                        # SELL conditions: EMA crossover DOWN or bearish trend with overbought RSI
-                        sell_signal = False
-                        if ema_crossover_down and signal_strength >= min_signal:
-                            sell_signal = True
-                        elif ema_bearish and rsi_overbought and signal_strength >= min_signal * 0.5:
-                            sell_signal = True
-                        
-                        if sell_signal:
-                            signals_found += 1
-                            entry_price = df['close'].iloc[i]
-                            atr = df['high'].iloc[i-20:i].max() - df['low'].iloc[i-20:i].min()
-                            if atr == 0:
-                                atr = df['close'].iloc[i] * 0.01
-                            
-                            sl_price = entry_price + (atr * sl_multi)
-                            tp_price = entry_price - (atr * sl_multi * rr_ratio)
-                            
-                            lookback_end = min(i + 200, len(df))
-                            future_high = df['high'].iloc[i:lookback_end].max()
-                            future_low = df['low'].iloc[i:lookback_end].min()
-                            
-                            if future_low <= tp_price:
-                                profit = (entry_price - tp_price) * 100
-                                wins += 1
-                                total_profit += profit
-                                balance += profit
-                                trades.append({
-                                    'time': df['time'].iloc[i],
-                                    'type': 'SELL',
-                                    'entry': entry_price,
-                                    'exit': tp_price,
-                                    'profit': profit,
-                                    'result': 'WIN'
-                                })
-                            elif future_high >= sl_price:
-                                loss = (entry_price - sl_price) * 100
-                                losses += 1
-                                total_profit += loss
-                                balance += loss
-                                trades.append({
-                                    'time': df['time'].iloc[i],
-                                    'type': 'SELL',
-                                    'entry': entry_price,
-                                    'exit': sl_price,
-                                    'profit': loss,
-                                    'result': 'LOSS'
-                                })
-                    
-                    # Progress update - calculating statistics
-                    self.root.after(0, lambda: self.update_backtest_progress(95, f"📈 Found {signals_found} signals, {len(trades)} trades executed"))
-                    
-                    # Calculate statistics
-                    total_trades = wins + losses
-                    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-                    avg_win = sum([t['profit'] for t in trades if t['result'] == 'WIN']) / wins if wins > 0 else 0
-                    avg_loss = sum([t['profit'] for t in trades if t['result'] == 'LOSS']) / losses if losses > 0 else 0
-                    profit_factor = abs(avg_win * wins / (avg_loss * losses)) if losses > 0 and avg_loss != 0 else 0
-                    roi = ((balance - 10000) / 10000 * 100) if balance > 0 else 0
-                    
-                    # Progress complete
-                    self.root.after(0, lambda: self.update_backtest_progress(100, "✅ Backtest completed!"))
-                    
-                    # Display results
+                    # Display results using BacktestMetrics
                     def show_results():
                         self.backtest_stats_text.delete(1.0, tk.END)
                         self.backtest_stats_text.insert(tk.END, "🗿 BACKTEST RESULTS\n")
                         self.backtest_stats_text.insert(tk.END, "=" * 60 + "\n\n")
                         self.backtest_stats_text.insert(tk.END, f"Symbol: {symbol}\n")
                         self.backtest_stats_text.insert(tk.END, f"Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n")
-                        self.backtest_stats_text.insert(tk.END, f"Bars analyzed: {len(df)}\n\n")
+                        self.backtest_stats_text.insert(tk.END, f"Bars analyzed: {len(df)}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Timeframe: M5\n\n")
                         
                         self.backtest_stats_text.insert(tk.END, "📊 PERFORMANCE METRICS:\n")
                         self.backtest_stats_text.insert(tk.END, "-" * 60 + "\n")
-                        self.backtest_stats_text.insert(tk.END, f"Total Trades: {total_trades}\n")
-                        self.backtest_stats_text.insert(tk.END, f"Wins: {wins} | Losses: {losses}\n")
-                        self.backtest_stats_text.insert(tk.END, f"Win Rate: {win_rate:.2f}%\n")
-                        self.backtest_stats_text.insert(tk.END, f"Total Profit: ${total_profit:.2f}\n")
-                        self.backtest_stats_text.insert(tk.END, f"ROI: {roi:.2f}%\n")
-                        self.backtest_stats_text.insert(tk.END, f"Final Balance: ${balance:.2f}\n")
-                        self.backtest_stats_text.insert(tk.END, f"Signals Found: {signals_found}\n")
-                        self.backtest_stats_text.insert(tk.END, f"Trade Execution Rate: {(total_trades/signals_found*100) if signals_found > 0 else 0:.1f}%\n\n")
+                        self.backtest_stats_text.insert(tk.END, f"Total Trades: {metrics.total_trades}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Winning: {metrics.winning_trades} | Losing: {metrics.losing_trades}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Win Rate: {metrics.win_rate:.2f}%\n")
+                        self.backtest_stats_text.insert(tk.END, f"Gross Profit: ${metrics.gross_profit:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Gross Loss: ${metrics.gross_loss:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Net Profit/Loss: ${metrics.net_profit:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"ROI: {metrics.total_return_pct:.2f}%\n")
+                        self.backtest_stats_text.insert(tk.END, f"Initial Balance: ${initial_balance:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Final Balance: ${metrics.final_balance:.2f}\n\n")
                         
                         self.backtest_stats_text.insert(tk.END, "💰 TRADE ANALYSIS:\n")
                         self.backtest_stats_text.insert(tk.END, "-" * 60 + "\n")
-                        self.backtest_stats_text.insert(tk.END, f"Avg Win: ${avg_win:.2f}\n")
-                        self.backtest_stats_text.insert(tk.END, f"Avg Loss: ${avg_loss:.2f}\n")
-                        self.backtest_stats_text.insert(tk.END, f"Profit Factor: {profit_factor:.2f}\n\n")
+                        self.backtest_stats_text.insert(tk.END, f"Avg Win: ${metrics.avg_win:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Avg Loss: ${metrics.avg_loss:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Profit Factor: {metrics.profit_factor:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Best Trade: ${metrics.best_trade:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Worst Trade: ${metrics.worst_trade:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Avg Trade Duration: {metrics.avg_trade_duration:.1f} minutes\n\n")
                         
-                        self.backtest_stats_text.insert(tk.END, "🎯 SETTINGS USED:\n")
+                        self.backtest_stats_text.insert(tk.END, "📈 RISK METRICS:\n")
+                        self.backtest_stats_text.insert(tk.END, "-" * 60 + "\n")
+                        self.backtest_stats_text.insert(tk.END, f"Max Drawdown: {metrics.max_drawdown_pct:.2f}%\n")
+                        self.backtest_stats_text.insert(tk.END, f"Sharpe Ratio: {metrics.sharpe_ratio:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Sortino Ratio: {metrics.sortino_ratio:.2f}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Calmar Ratio: {metrics.calmar_ratio:.2f}\n\n")
+                        
+                        self.backtest_stats_text.insert(tk.END, "🎯 STRATEGY SETTINGS:\n")
                         self.backtest_stats_text.insert(tk.END, "-" * 60 + "\n")
                         self.backtest_stats_text.insert(tk.END, f"Min Signal Strength: {min_signal}\n")
                         self.backtest_stats_text.insert(tk.END, f"SL Multiplier: {sl_multi}\n")
-                        self.backtest_stats_text.insert(tk.END, f"Risk:Reward: {rr_ratio}\n")
-                        self.backtest_stats_text.insert(tk.END, f"ML Enabled: {'Yes' if use_ml else 'No'}\n\n")
+                        self.backtest_stats_text.insert(tk.END, f"Risk:Reward Ratio: {rr_ratio}\n")
+                        self.backtest_stats_text.insert(tk.END, f"Commission (per side): 0.02%\n")
+                        self.backtest_stats_text.insert(tk.END, f"Slippage: 0.1 pips\n\n")
                         
                         # Show trades
+                        self.backtest_trades_text.delete(1.0, tk.END)
                         self.backtest_trades_text.insert(tk.END, "📋 TRADE HISTORY\n")
-                        self.backtest_trades_text.insert(tk.END, "=" * 80 + "\n\n")
+                        self.backtest_trades_text.insert(tk.END, "=" * 120 + "\n\n")
                         
-                        if total_trades == 0:
+                        if metrics.total_trades == 0:
                             self.backtest_trades_text.insert(tk.END, "⚠️ No trades generated during this backtest.\n\n")
-                            self.backtest_trades_text.insert(tk.END, "💡 Suggestions:\n")
+                            self.backtest_trades_text.insert(tk.END, "💡 Suggestions to generate more signals:\n")
                             self.backtest_trades_text.insert(tk.END, "  • Lower min signal strength (try 0.3-0.4)\n")
-                            self.backtest_trades_text.insert(tk.END, "  • Increase test period (try 30+ days)\n")
+                            self.backtest_trades_text.insert(tk.END, "  • Increase test period (try 30-90 days)\n")
                             self.backtest_trades_text.insert(tk.END, "  • Check if symbol has sufficient volatility\n")
-                            self.backtest_trades_text.insert(tk.END, "  • Verify data availability for selected period\n")
+                            self.backtest_trades_text.insert(tk.END, "  • Verify MT5 connection and data availability\n")
                         else:
-                            self.backtest_trades_text.insert(tk.END, f"{'Time':<20} {'Type':<6} {'Entry':<10} {'Exit':<10} {'P&L':<10} {'Result'}\n")
-                            self.backtest_trades_text.insert(tk.END, "-" * 80 + "\n")
+                            header = f"{'#':<4} {'Entry Time':<20} {'Exit Time':<20} {'Type':<6} {'Entry Price':<12} {'Exit Price':<12} {'P&L':<12} {'Status':<8}\n"
+                            self.backtest_trades_text.insert(tk.END, header)
+                            self.backtest_trades_text.insert(tk.END, "-" * 120 + "\n")
                             
-                            for trade in trades[:50]:  # Show first 50 trades
-                                time_str = trade['time'].strftime('%Y-%m-%d %H:%M')
-                                self.backtest_trades_text.insert(tk.END, 
-                                    f"{time_str:<20} {trade['type']:<6} {trade['entry']:<10.5f} {trade['exit']:<10.5f} "
-                                    f"${trade['profit']:<9.2f} {trade['result']}\n")
+                            # Display first 100 trades
+                            for idx, trade in enumerate(engine.trades[:100], 1):
+                                entry_time = trade.entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(trade.entry_time, 'strftime') else str(trade.entry_time)
+                                exit_time = trade.exit_time.strftime('%Y-%m-%d %H:%M:%S') if trade.exit_time and hasattr(trade.exit_time, 'strftime') else (str(trade.exit_time) if trade.exit_time else "OPEN")
+                                status = "✓ WIN" if trade.win else "✗ LOSS"
+                                
+                                line = f"{idx:<4} {entry_time:<20} {exit_time:<20} {trade.trade_type:<6} {trade.entry_price:<12.5f} {(trade.exit_price if trade.exit_price else 0):<12.5f} ${trade.pnl_after_commission:<11.2f} {status:<8}\n"
+                                self.backtest_trades_text.insert(tk.END, line)
                             
-                            if len(trades) > 50:
-                                self.backtest_trades_text.insert(tk.END, f"\n... and {len(trades)-50} more trades\n")
+                            if len(engine.trades) > 100:
+                                self.backtest_trades_text.insert(tk.END, f"\n... and {len(engine.trades)-100} more trades (export CSV for full history)\n")
+                        
+                        self.backtest_stats_text.insert(tk.END, "\n✅ Backtest completed successfully!\n")
                     
                     self.root.after(0, show_results)
+                    
+                    # Export results to CSV
+                    try:
+                        engine.export_results("backtest_results.csv")
+                        self.root.after(0, lambda: self.backtest_stats_text.insert(tk.END, "📁 Results exported to backtest_results.csv\n"))
+                    except Exception as e:
+                        self.root.after(0, lambda: self.backtest_stats_text.insert(tk.END, f"⚠️ Could not export CSV: {str(e)}\n"))
                     
                 except Exception as e:
                     self.root.after(0, lambda: self.update_backtest_status(f"❌ Error: {str(e)}", error=True))
